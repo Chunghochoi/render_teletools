@@ -7,19 +7,21 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
+# ===================== CONFIG =====================
+# Chỉ AGENT cần API_KEY (để pull/push). WEB KHÔNG CẦN.
 API_KEY = os.environ.get("API_KEY", "")  # set trên Render
 if not API_KEY:
-    print("[WARN] API_KEY env is empty. Set it on Render!")
+    print("[WARN] API_KEY env is empty. Agent endpoints will be unprotected!")
 
-# In-memory storage (Render restart/sleep là mất)
+# In-memory storage (Render free sleep/restart => mất dữ liệu)
 commands: List[Dict[str, Any]] = []  # queue: {id, ts, cmd, count, delay}
 links: List[Dict[str, Any]] = []     # {ts, url}
 
 cmd_lock = asyncio.Lock()
 link_lock = asyncio.Lock()
 
-CMD_MAX = 200
-LINK_MAX = 2000
+CMD_MAX = 300
+LINK_MAX = 3000
 
 
 def now_ts() -> float:
@@ -30,17 +32,19 @@ def fmt_time(ts: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts))
 
 
-def auth(x_api_key: Optional[str]):
-    if not API_KEY or x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def require_agent(x_api_key: Optional[str]):
+    # Nếu bạn set API_KEY => bắt buộc đúng key
+    # Nếu bạn không set API_KEY => ai cũng gọi được (không khuyến nghị)
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized (agent)")
 
 
-app = FastAPI(title="Relay Dashboard (Render)")
+app = FastAPI(title="Relay Dashboard (Render Free)")
 
-
+# ===================== UI PAGE =====================
 def page() -> str:
     # Không dùng f-string để khỏi vướng { } trong JS
-    html = r"""
+    return r"""
 <!doctype html>
 <html>
 <head>
@@ -59,6 +63,7 @@ def page() -> str:
     button.secondary { background:#243055; }
     button.danger { background:#ff3b5c; }
     .btns { display:flex; gap:10px; flex-wrap: wrap; }
+    .hint { font-size:12px; opacity:.85; margin-top: 6px; line-height:1.4; }
 
     .linksCard { flex: 1 1 auto; display:flex; flex-direction: column; min-height: 0; }
     .toolbar { display:flex; gap:10px; align-items:center; flex-wrap: wrap; margin-top: 10px; }
@@ -68,7 +73,6 @@ def page() -> str:
     .time { opacity:.75; font-size:12px; width:70px; flex:0 0 auto; }
     .url { flex: 1 1 auto; word-break: break-all; color:#8fb2ff; text-decoration:none; }
     .mini { padding:8px 10px; border-radius:10px; font-weight:700; }
-    .hint { font-size:12px; opacity:.85; margin-top: 6px; line-height:1.4; }
     .topline { display:flex; justify-content: space-between; gap:12px; flex-wrap:wrap; align-items:center; }
   </style>
 </head>
@@ -79,15 +83,12 @@ def page() -> str:
       <h1>
         Uptolink Dashboard (Relay)
         <span class="pill" id="status">loading...</span>
+        <span class="pill">Public UI (no API key)</span>
       </h1>
-      <span class="pill">Render free: links/commands lưu RAM (restart là mất)</span>
+      <span class="pill">Render free: RAM only (restart/sleep = mất links)</span>
     </div>
 
     <div class="row">
-      <div>
-        <label>API Key (bắt buộc)</label>
-        <input id="key" type="password" placeholder="X-API-Key" />
-      </div>
       <div>
         <label>Số lần gửi</label>
         <input id="count" type="number" min="1" max="200" value="1" />
@@ -107,7 +108,7 @@ def page() -> str:
     </div>
 
     <div class="hint">
-      Bạn bấm nút ở đây → agent trên máy bạn sẽ poll và gửi lệnh vào bot → bot trả về link → agent đẩy link lên dashboard.
+      Bạn bấm nút ở đây → agent trên máy bạn sẽ poll lệnh → gửi bot → lọc link uptolink → đẩy link lên dashboard này.
     </div>
   </div>
 
@@ -130,7 +131,15 @@ def page() -> str:
 <script>
 let cachedLinks = [];
 
-function key() { return (document.getElementById('key').value || '').trim(); }
+async function getStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const j = await r.json();
+    document.getElementById('status').textContent = j.ok ? 'ok' : 'not ready';
+  } catch (e) {
+    document.getElementById('status').textContent = 'offline';
+  }
+}
 
 function readParams() {
   const count = parseInt(document.getElementById('count').value || '1', 10);
@@ -138,34 +147,20 @@ function readParams() {
   return { count, delay };
 }
 
-async function api(path, opts={}) {
-  const headers = Object.assign({}, opts.headers || {});
-  headers['X-API-Key'] = key();
-  opts.headers = headers;
-  const r = await fetch(path, opts);
-  const j = await r.json().catch(() => ({}));
-  return { r, j };
-}
-
-async function getStatus() {
-  const { r, j } = await api('/api/status');
-  const el = document.getElementById('status');
-  if (r.ok) el.textContent = 'ok';
-  else el.textContent = 'need key / offline';
-}
-
 async function sendCmd(cmd) {
   const p = readParams();
-  const { r, j } = await api('/api/command', {
+  const r = await fetch('/api/command', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ cmd, count: p.count, delay: p.delay })
   });
+  const j = await r.json().catch(() => ({}));
   if (!r.ok) alert(j.detail || j.error || 'failed');
 }
 
 async function refreshLinks() {
-  const { r, j } = await api('/api/links');
+  const r = await fetch('/api/links');
+  const j = await r.json();
   cachedLinks = (j.links || []);
   document.getElementById('countLinks').textContent = cachedLinks.length + ' links';
   renderLinks();
@@ -213,7 +208,8 @@ async function copyText(text) {
 }
 
 async function clearLinks() {
-  const { r, j } = await api('/api/links/clear', { method: 'POST' });
+  const r = await fetch('/api/links/clear', { method: 'POST' });
+  const j = await r.json().catch(() => ({}));
   if (!r.ok) alert(j.detail || j.error || 'failed');
   await refreshLinks();
 }
@@ -245,23 +241,21 @@ boot();
 </body>
 </html>
 """
-    return html
 
 
+# ===================== ROUTES (PUBLIC WEB) =====================
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return HTMLResponse(page())
 
 
 @app.get("/api/status")
-async def status(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    auth(x_api_key)
+async def status():
     return JSONResponse({"ok": True})
 
 
 @app.post("/api/command")
-async def post_command(payload: Dict[str, Any], x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    auth(x_api_key)
+async def post_command(payload: Dict[str, Any]):
     cmd = str(payload.get("cmd", "")).strip()
     count = int(payload.get("count", 1))
     delay = float(payload.get("delay", 5))
@@ -282,10 +276,24 @@ async def post_command(payload: Dict[str, Any], x_api_key: Optional[str] = Heade
     return JSONResponse({"ok": True})
 
 
+@app.get("/api/links")
+async def get_links():
+    async with link_lock:
+        out = [{"time": fmt_time(x["ts"]), "url": x["url"]} for x in links]
+    return JSONResponse({"ok": True, "links": out})
+
+
+@app.post("/api/links/clear")
+async def clear_links():
+    async with link_lock:
+        links.clear()
+    return JSONResponse({"ok": True})
+
+
+# ===================== ROUTES (AGENT ONLY) =====================
 @app.post("/api/pull")
 async def pull_command(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    """Agent gọi để lấy 1 command (FIFO)."""
-    auth(x_api_key)
+    require_agent(x_api_key)
     async with cmd_lock:
         if not commands:
             return JSONResponse({"ok": True, "command": None})
@@ -295,39 +303,22 @@ async def pull_command(x_api_key: Optional[str] = Header(default=None, alias="X-
 
 @app.post("/api/push_links")
 async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    """Agent đẩy link lên server."""
-    auth(x_api_key)
+    require_agent(x_api_key)
     arr = payload.get("links", [])
     if not isinstance(arr, list):
         return JSONResponse({"ok": False, "error": "links must be a list"}, status_code=400)
 
     async with link_lock:
         for url in arr:
-            if not isinstance(url, str):
-                continue
-            links.append({"ts": now_ts(), "url": url})
+            if isinstance(url, str) and url:
+                links.append({"ts": now_ts(), "url": url})
         if len(links) > LINK_MAX:
             del links[: len(links) - LINK_MAX]
 
     return JSONResponse({"ok": True})
 
 
-@app.get("/api/links")
-async def get_links(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    auth(x_api_key)
-    async with link_lock:
-        out = [{"time": fmt_time(x["ts"]), "url": x["url"]} for x in links]
-    return JSONResponse({"ok": True, "links": out})
-
-
-@app.post("/api/links/clear")
-async def clear_links(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    auth(x_api_key)
-    async with link_lock:
-        links.clear()
-    return JSONResponse({"ok": True})
-
-
+# ===================== MAIN =====================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
