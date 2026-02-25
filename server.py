@@ -39,11 +39,19 @@ def require_agent(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="Unauthorized (agent)")
 
 
+# ✅ Danh sách lệnh hợp lệ (đã sửa /uptolinksocical + thêm /view /checkin)
+ALLOWED_COMMANDS = (
+    "/start",
+    "/uptolinkstep2",
+    "/uptolinksocical",
+    "/view",
+    "/checkin",
+)
+
 app = FastAPI(title="Relay Dashboard (Render Free)")
 
 # ===================== UI PAGE =====================
 def page() -> str:
-    # Không dùng f-string để khỏi vướng { } trong JS
     return r"""
 <!doctype html>
 <html>
@@ -101,14 +109,17 @@ def page() -> str:
       <div class="btns">
         <button onclick="sendCmd('/start')">/start</button>
         <button onclick="sendCmd('/uptolinkstep2')">/uptolinkstep2</button>
-        <button onclick="sendCmd('/uptolinksocial')">/uptolinksocial</button>
+        <button onclick="sendCmd('/uptolinksocical')">/uptolinksocical</button>
+        <button class="secondary" onclick="sendCmd('/view')">/view</button>
+        <button class="secondary" onclick="sendCmd('/checkin')">/checkin</button>
+
         <button class="secondary" onclick="refreshAll()">Refresh</button>
         <button class="danger" onclick="clearLinks()">Clear links</button>
       </div>
     </div>
 
     <div class="hint">
-      Bạn bấm nút ở đây → agent trên máy bạn sẽ poll lệnh → gửi bot → lọc link uptolink → đẩy link lên dashboard này.
+      Bấm nút → agent trên máy bạn poll lệnh → gửi bot → lọc link uptolink → đẩy link lên đây.
     </div>
   </div>
 
@@ -251,7 +262,7 @@ async def home():
 
 @app.get("/api/status")
 async def status():
-    return JSONResponse({"ok": True})
+    return JSONResponse({"ok": True, "allowed_commands": list(ALLOWED_COMMANDS)})
 
 
 @app.post("/api/command")
@@ -260,9 +271,11 @@ async def post_command(payload: Dict[str, Any]):
     count = int(payload.get("count", 1))
     delay = float(payload.get("delay", 5))
 
-    allowed = ("/start", "/uptolinkstep2", "/uptolinksocial")
-    if cmd not in allowed:
-        return JSONResponse({"ok": False, "error": f"Unsupported cmd. Allowed: {allowed}"}, status_code=400)
+    if cmd not in ALLOWED_COMMANDS:
+        return JSONResponse(
+            {"ok": False, "error": f"Unsupported cmd. Allowed: {ALLOWED_COMMANDS}"},
+            status_code=400,
+        )
     if not (1 <= count <= 200):
         return JSONResponse({"ok": False, "error": "count must be 1..200"}, status_code=400)
     if delay < 0:
