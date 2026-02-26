@@ -7,21 +7,19 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-# ===================== CONFIG =====================
-# Chỉ AGENT cần API_KEY (để pull/push). WEB KHÔNG CẦN.
 API_KEY = os.environ.get("API_KEY", "")  # set trên Render
 if not API_KEY:
-    print("[WARN] API_KEY env is empty. Agent endpoints will be unprotected!")
+    print("[WARN] API_KEY env is empty. Set it on Render!")
 
-# In-memory storage (Render free sleep/restart => mất dữ liệu)
+# In-memory storage (Render restart/sleep là mất)
 commands: List[Dict[str, Any]] = []  # queue: {id, ts, cmd, count, delay}
 links: List[Dict[str, Any]] = []     # {ts, url}
 
 cmd_lock = asyncio.Lock()
 link_lock = asyncio.Lock()
 
-CMD_MAX = 300
-LINK_MAX = 3000
+CMD_MAX = 200
+LINK_MAX = 2000
 
 
 def now_ts() -> float:
@@ -32,27 +30,17 @@ def fmt_time(ts: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts))
 
 
-def require_agent(x_api_key: Optional[str]):
-    # Nếu bạn set API_KEY => bắt buộc đúng key
-    # Nếu bạn không set API_KEY => ai cũng gọi được (không khuyến nghị)
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized (agent)")
+def auth(x_api_key: Optional[str]):
+    if not API_KEY or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# ✅ Danh sách lệnh hợp lệ (đã sửa /uptolinksocical + thêm /view /checkin)
-ALLOWED_COMMANDS = (
-    "/start",
-    "/uptolinkstep2",
-    "/uptolinksocical",
-    "/view",
-    "/checkin",
-)
+app = FastAPI(title="Relay Dashboard (Render)")
 
-app = FastAPI(title="Relay Dashboard (Render Free)")
 
-# ===================== UI PAGE =====================
 def page() -> str:
-    return r"""
+    # Không dùng f-string để khỏi vướng { } trong JS
+    html = r"""
 <!doctype html>
 <html>
 <head>
@@ -71,7 +59,6 @@ def page() -> str:
     button.secondary { background:#243055; }
     button.danger { background:#ff3b5c; }
     .btns { display:flex; gap:10px; flex-wrap: wrap; }
-    .hint { font-size:12px; opacity:.85; margin-top: 6px; line-height:1.4; }
 
     .linksCard { flex: 1 1 auto; display:flex; flex-direction: column; min-height: 0; }
     .toolbar { display:flex; gap:10px; align-items:center; flex-wrap: wrap; margin-top: 10px; }
@@ -81,6 +68,7 @@ def page() -> str:
     .time { opacity:.75; font-size:12px; width:70px; flex:0 0 auto; }
     .url { flex: 1 1 auto; word-break: break-all; color:#8fb2ff; text-decoration:none; }
     .mini { padding:8px 10px; border-radius:10px; font-weight:700; }
+    .hint { font-size:12px; opacity:.85; margin-top: 6px; line-height:1.4; }
     .topline { display:flex; justify-content: space-between; gap:12px; flex-wrap:wrap; align-items:center; }
   </style>
 </head>
@@ -91,12 +79,15 @@ def page() -> str:
       <h1>
         Uptolink Dashboard (Relay)
         <span class="pill" id="status">loading...</span>
-        <span class="pill">Public UI (no API key)</span>
       </h1>
-      <span class="pill">Render free: RAM only (restart/sleep = mất links)</span>
+      <span class="pill">Render free: links/commands lưu RAM (restart là mất)</span>
     </div>
 
     <div class="row">
+      <div>
+        <label>API Key (bắt buộc)</label>
+        <input id="key" type="password" placeholder="X-API-Key" />
+      </div>
       <div>
         <label>Số lần gửi</label>
         <input id="count" type="number" min="1" max="200" value="1" />
@@ -107,19 +98,16 @@ def page() -> str:
       </div>
 
       <div class="btns">
-        <button onclick="sendCmd('/start')">/start</button>
-        <button onclick="sendCmd('/uptolinkstep2')">/uptolinkstep2</button>
-        <button onclick="sendCmd('/uptolinksocical')">/uptolinksocical</button>
-        <button class="secondary" onclick="sendCmd('/view')">/view</button>
-        <button class="secondary" onclick="sendCmd('/checkin')">/checkin</button>
-
-        <button class="secondary" onclick="refreshAll()">Refresh</button>
-        <button class="danger" onclick="clearLinks()">Clear links</button>
+        <button id="btnStart">/start</button>
+        <button id="btnStep2">/uptolinkstep2</button>
+        <button id="btnSocial">/uptolinksocial</button>
+        <button class="secondary" id="btnRefresh">Refresh</button>
+        <button class="danger" id="btnClear">Clear links</button>
       </div>
     </div>
 
     <div class="hint">
-      Bấm nút → agent trên máy bạn poll lệnh → gửi bot → lọc link uptolink → đẩy link lên đây.
+      Bạn bấm nút ở đây → agent trên máy bạn sẽ poll và gửi lệnh vào bot → bot trả về link → agent đẩy link lên dashboard.
     </div>
   </div>
 
@@ -130,9 +118,9 @@ def page() -> str:
     </div>
 
     <div class="toolbar">
-      <input class="search" id="q" placeholder="Search in links..." oninput="renderLinks()" />
-      <button class="secondary" onclick="copyAll()">Copy all</button>
-      <button class="secondary" onclick="openAll()">Open all</button>
+      <input class="search" id="q" placeholder="Search in links..." />
+      <button class="secondary" id="btnCopyAll">Copy all</button>
+      <button class="secondary" id="btnOpenAll">Open all</button>
     </div>
 
     <div class="linksBox" id="links">(loading...)</div>
@@ -142,15 +130,7 @@ def page() -> str:
 <script>
 let cachedLinks = [];
 
-async function getStatus() {
-  try {
-    const r = await fetch('/api/status');
-    const j = await r.json();
-    document.getElementById('status').textContent = j.ok ? 'ok' : 'not ready';
-  } catch (e) {
-    document.getElementById('status').textContent = 'offline';
-  }
-}
+function key() { return (document.getElementById('key').value || '').trim(); }
 
 function readParams() {
   const count = parseInt(document.getElementById('count').value || '1', 10);
@@ -158,81 +138,115 @@ function readParams() {
   return { count, delay };
 }
 
+async function api(path, opts={}) {
+  const headers = Object.assign({}, opts.headers || {});
+  headers['X-API-Key'] = key();
+  opts.headers = headers;
+  const r = await fetch(path, opts);
+  const j = await r.json().catch(() => ({}));
+  return { r, j };
+}
+
+async function getStatus() {
+  const { r } = await api('/api/status');
+  const el = document.getElementById('status');
+  el.textContent = r.ok ? 'ok' : 'need key / offline';
+}
+
 async function sendCmd(cmd) {
   const p = readParams();
-  const r = await fetch('/api/command', {
+  const { r, j } = await api('/api/command', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ cmd, count: p.count, delay: p.delay })
   });
-  const j = await r.json().catch(() => ({}));
   if (!r.ok) alert(j.detail || j.error || 'failed');
 }
 
 async function refreshLinks() {
-  const r = await fetch('/api/links');
-  const j = await r.json();
+  const { j } = await api('/api/links');
   cachedLinks = (j.links || []);
   document.getElementById('countLinks').textContent = cachedLinks.length + ' links';
   renderLinks();
 }
 
-function escapeHtml(s) {
-  return (s || '')
-    .replaceAll('&','&amp;')
-    .replaceAll('<','&lt;')
-    .replaceAll('>','&gt;')
-    .replaceAll('"','&quot;')
-    .replaceAll("'","&#39;");
+function createLinkRow(item) {
+  const row = document.createElement('div');
+  row.className = 'linkrow';
+
+  const t = document.createElement('span');
+  t.className = 'time';
+  t.textContent = `[${item.time || ''}]`;
+
+  const a = document.createElement('a');
+  a.className = 'url';
+  a.href = item.url || '#';
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  a.textContent = item.url || '';
+
+  const btnCopy = document.createElement('button');
+  btnCopy.className = 'mini secondary';
+  btnCopy.textContent = 'Copy';
+  btnCopy.dataset.url = item.url || '';
+
+  const btnOpen = document.createElement('button');
+  btnOpen.className = 'mini';
+  btnOpen.textContent = 'Open';
+  btnOpen.dataset.url = item.url || '';
+
+  row.appendChild(t);
+  row.appendChild(a);
+  row.appendChild(btnCopy);
+  row.appendChild(btnOpen);
+  return row;
 }
 
 function renderLinks() {
   const box = document.getElementById('links');
   const q = (document.getElementById('q').value || '').trim().toLowerCase();
-  const arr = q ? cachedLinks.filter(x => (x.url||'').toLowerCase().includes(q)) : cachedLinks;
+  const arr = q ? cachedLinks.filter(x => (x.url || '').toLowerCase().includes(q)) : cachedLinks;
 
-  if (arr.length === 0) { box.innerHTML = '(no links yet)'; return; }
+  if (!arr.length) {
+    box.textContent = '(no links yet)';
+    return;
+  }
 
-  box.innerHTML = arr.map((x) => {
-    const safeUrl = escapeHtml(x.url);
-    const safeTime = escapeHtml(x.time);
-    return `
-      <div class="linkrow">
-        <span class="time">[${safeTime}]</span>
-        <a class="url" href="${safeUrl}" target="_blank">${safeUrl}</a>
-        <button class="mini secondary" onclick="copyText('${safeUrl}')">Copy</button>
-        <button class="mini" onclick="window.open('${safeUrl}', '_blank')">Open</button>
-      </div>
-    `;
-  }).join('');
+  box.innerHTML = '';
+  for (const item of arr) {
+    box.appendChild(createLinkRow(item));
+  }
   box.scrollTop = box.scrollHeight;
 }
 
 async function copyText(text) {
-  try { await navigator.clipboard.writeText(text); }
-  catch (e) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
     const ta = document.createElement('textarea');
-    ta.value = text; document.body.appendChild(ta);
-    ta.select(); document.execCommand('copy');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
     document.body.removeChild(ta);
   }
 }
 
 async function clearLinks() {
-  const r = await fetch('/api/links/clear', { method: 'POST' });
-  const j = await r.json().catch(() => ({}));
+  const { r, j } = await api('/api/links/clear', { method: 'POST' });
   if (!r.ok) alert(j.detail || j.error || 'failed');
   await refreshLinks();
 }
 
 async function copyAll() {
   if (!cachedLinks.length) return;
-  await copyText(cachedLinks.map(x => x.url).join('\\n'));
+  await copyText(cachedLinks.map(x => x.url).join('\n'));
 }
 
 async function openAll() {
   for (const x of cachedLinks) {
-    window.open(x.url, '_blank');
+    if (!x.url) continue;
+    window.open(x.url, '_blank', 'noopener');
     await new Promise(res => setTimeout(res, 250));
   }
 }
@@ -242,40 +256,66 @@ async function refreshAll() {
   await refreshLinks();
 }
 
+function bindEvents() {
+  document.getElementById('btnStart').addEventListener('click', () => sendCmd('/start'));
+  document.getElementById('btnStep2').addEventListener('click', () => sendCmd('/uptolinkstep2'));
+  document.getElementById('btnSocial').addEventListener('click', () => sendCmd('/uptolinksocial'));
+  document.getElementById('btnRefresh').addEventListener('click', refreshAll);
+  document.getElementById('btnClear').addEventListener('click', clearLinks);
+  document.getElementById('btnCopyAll').addEventListener('click', copyAll);
+  document.getElementById('btnOpenAll').addEventListener('click', openAll);
+  document.getElementById('q').addEventListener('input', renderLinks);
+
+  document.getElementById('links').addEventListener('click', async (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || !target.classList.contains('mini')) return;
+    const url = target.dataset.url || '';
+    if (!url) return;
+
+    if (target.classList.contains('secondary')) {
+      await copyText(url);
+      return;
+    }
+    window.open(url, '_blank', 'noopener');
+  });
+}
+
 async function boot() {
+  bindEvents();
   await refreshAll();
   setInterval(refreshLinks, 1500);
   setInterval(getStatus, 5000);
 }
+
 boot();
 </script>
 </body>
 </html>
 """
+    return html
 
 
-# ===================== ROUTES (PUBLIC WEB) =====================
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return HTMLResponse(page())
 
 
 @app.get("/api/status")
-async def status():
-    return JSONResponse({"ok": True, "allowed_commands": list(ALLOWED_COMMANDS)})
+async def status(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    auth(x_api_key)
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/command")
-async def post_command(payload: Dict[str, Any]):
+async def post_command(payload: Dict[str, Any], x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    auth(x_api_key)
     cmd = str(payload.get("cmd", "")).strip()
     count = int(payload.get("count", 1))
     delay = float(payload.get("delay", 5))
 
-    if cmd not in ALLOWED_COMMANDS:
-        return JSONResponse(
-            {"ok": False, "error": f"Unsupported cmd. Allowed: {ALLOWED_COMMANDS}"},
-            status_code=400,
-        )
+    allowed = ("/start", "/uptolinkstep2", "/uptolinksocial")
+    if cmd not in allowed:
+        return JSONResponse({"ok": False, "error": f"Unsupported cmd. Allowed: {allowed}"}, status_code=400)
     if not (1 <= count <= 200):
         return JSONResponse({"ok": False, "error": "count must be 1..200"}, status_code=400)
     if delay < 0:
@@ -289,24 +329,10 @@ async def post_command(payload: Dict[str, Any]):
     return JSONResponse({"ok": True})
 
 
-@app.get("/api/links")
-async def get_links():
-    async with link_lock:
-        out = [{"time": fmt_time(x["ts"]), "url": x["url"]} for x in links]
-    return JSONResponse({"ok": True, "links": out})
-
-
-@app.post("/api/links/clear")
-async def clear_links():
-    async with link_lock:
-        links.clear()
-    return JSONResponse({"ok": True})
-
-
-# ===================== ROUTES (AGENT ONLY) =====================
 @app.post("/api/pull")
 async def pull_command(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    require_agent(x_api_key)
+    """Agent gọi để lấy 1 command (FIFO)."""
+    auth(x_api_key)
     async with cmd_lock:
         if not commands:
             return JSONResponse({"ok": True, "command": None})
@@ -316,22 +342,39 @@ async def pull_command(x_api_key: Optional[str] = Header(default=None, alias="X-
 
 @app.post("/api/push_links")
 async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    require_agent(x_api_key)
+    """Agent đẩy link lên server."""
+    auth(x_api_key)
     arr = payload.get("links", [])
     if not isinstance(arr, list):
         return JSONResponse({"ok": False, "error": "links must be a list"}, status_code=400)
 
     async with link_lock:
         for url in arr:
-            if isinstance(url, str) and url:
-                links.append({"ts": now_ts(), "url": url})
+            if not isinstance(url, str):
+                continue
+            links.append({"ts": now_ts(), "url": url})
         if len(links) > LINK_MAX:
             del links[: len(links) - LINK_MAX]
 
     return JSONResponse({"ok": True})
 
 
-# ===================== MAIN =====================
+@app.get("/api/links")
+async def get_links(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    auth(x_api_key)
+    async with link_lock:
+        out = [{"time": fmt_time(x["ts"]), "url": x["url"]} for x in links]
+    return JSONResponse({"ok": True, "links": out})
+
+
+@app.post("/api/links/clear")
+async def clear_links(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
+    auth(x_api_key)
+    async with link_lock:
+        links.clear()
+    return JSONResponse({"ok": True})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
