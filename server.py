@@ -16,6 +16,7 @@ if not API_KEY:
 # In-memory storage (Render free sleep/restart => mất dữ liệu)
 commands: List[Dict[str, Any]] = []  # queue: {id, ts, cmd, count, delay}
 links: List[Dict[str, Any]] = []     # {ts, url}
+claimed_urls = set()  # URL đã được phân phối cho profile nào đó
 
 cmd_lock = asyncio.Lock()
 link_lock = asyncio.Lock()
@@ -134,6 +135,7 @@ def page() -> str:
       <input class="search" id="q" placeholder="Search in links..." oninput="renderLinks()" />
       <button class="secondary" onclick="copyAll()">Copy all</button>
       <button class="secondary" onclick="openAll()">Open all</button>
+      <button id="autoBtn" class="secondary" onclick="toggleAutoOpen()">Auto-open: OFF</button>
     </div>
 
     <div class="linksBox" id="links">(loading...)</div>
@@ -142,6 +144,16 @@ def page() -> str:
 
 <script>
 let cachedLinks = [];
+let autoOpenEnabled = localStorage.getItem('autoOpenEnabled') === '1';
+const profileClientId = (() => {
+  const k = 'profileClientId';
+  let v = localStorage.getItem(k);
+  if (!v) {
+    v = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(16).slice(2));
+    localStorage.setItem(k, v);
+  }
+  return v;
+})();
 
 async function getStatus() {
   try {
@@ -240,15 +252,48 @@ async function openAll() {
   }
 }
 
+
+function updateAutoButton() {
+  const b = document.getElementById('autoBtn');
+  if (!b) return;
+  b.textContent = 'Auto-open: ' + (autoOpenEnabled ? 'ON' : 'OFF');
+  b.style.background = autoOpenEnabled ? '#0f9d58' : '#243055';
+}
+
+function toggleAutoOpen() {
+  autoOpenEnabled = !autoOpenEnabled;
+  localStorage.setItem('autoOpenEnabled', autoOpenEnabled ? '1' : '0');
+  updateAutoButton();
+}
+
+async function claimAndOpenOne() {
+  if (!autoOpenEnabled) return;
+  try {
+    const r = await fetch('/api/links/claim', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ client_id: profileClientId })
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok || !j.url) return;
+    const win = window.open(j.url, '_blank', 'noopener');
+    if (!win) {
+      console.warn('Popup blocked: browser chặn mở tab tự động. Hãy cho phép popups cho site này.');
+    }
+  } catch (e) {}
+}
+
 async function refreshAll() {
   await getStatus();
   await refreshLinks();
 }
 
 async function boot() {
+  updateAutoButton();
   await refreshAll();
   setInterval(refreshLinks, 1500);
   setInterval(getStatus, 5000);
+  setInterval(claimAndOpenOne, 1200);
 }
 boot();
 </script>
@@ -303,6 +348,7 @@ async def get_links():
 async def clear_links():
     async with link_lock:
         links.clear()
+        claimed_urls.clear()
     return JSONResponse({"ok": True})
 
 
@@ -332,6 +378,25 @@ async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(
             del links[: len(links) - LINK_MAX]
 
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/links/claim")
+async def claim_link(payload: Dict[str, Any]):
+    client_id = str(payload.get("client_id", "")).strip()
+    if not client_id:
+        return JSONResponse({"ok": False, "error": "client_id is required"}, status_code=400)
+
+    async with link_lock:
+        for item in links:
+            url = item.get("url")
+            if not isinstance(url, str) or not url:
+                continue
+            if url in claimed_urls:
+                continue
+            claimed_urls.add(url)
+            return JSONResponse({"ok": True, "url": url})
+
+    return JSONResponse({"ok": True, "url": None})
 
 
 # ===================== MAIN =====================
