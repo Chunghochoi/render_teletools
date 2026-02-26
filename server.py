@@ -23,8 +23,12 @@ links: List[Dict[str, Any]] = []  # history {ts, url}
 known_urls = set()  # chống push trùng cùng URL
 pending_urls: Deque[str] = deque()  # chờ phân phối cho máy
 
+# phân phối theo chu kỳ: mỗi máy tối đa 1 link / 1 chu kỳ nhận link từ bot
+current_cycle_id = 0
+cycle_served_ips = set()
+
 # machine theo IP
-# machines[ip] = {"last_seen": float, "queue": deque[str]}
+# machines[ip] = {"last_seen": float, "queue": deque[str], "last_cycle": int}
 machines: Dict[str, Dict[str, Any]] = {}
 
 cmd_lock = asyncio.Lock()
@@ -53,7 +57,7 @@ def get_client_ip(request: Request) -> str:
 
 def ensure_machine(ip: str):
     if ip not in machines:
-        machines[ip] = {"last_seen": now_ts(), "queue": deque()}
+        machines[ip] = {"last_seen": now_ts(), "queue": deque(), "last_cycle": -1}
     else:
         machines[ip]["last_seen"] = now_ts()
 
@@ -66,21 +70,32 @@ def prune_inactive_machines_locked():
         q = machines[ip].get("queue") or deque()
         while q:
             pending_urls.appendleft(q.pop())
+        cycle_served_ips.discard(ip)
         del machines[ip]
 
 
 def distribute_links_locked():
-    # Mỗi máy nhận tối đa 1 link tại một thời điểm
-    active_ips = [ip for ip, info in machines.items() if now_ts() - float(info.get("last_seen", 0)) <= MACHINE_TTL_SECONDS]
-    if not active_ips:
+    # Mỗi chu kỳ: mỗi máy chỉ được nhận tối đa 1 link
+    active_ips = [
+        ip for ip, info in machines.items() if now_ts() - float(info.get("last_seen", 0)) <= MACHINE_TTL_SECONDS
+    ]
+    if not active_ips or not pending_urls:
         return
 
-    # Ưu tiên máy nào chưa có task
-    idle_ips = [ip for ip in active_ips if not machines[ip]["queue"]]
-    for ip in idle_ips:
+    # chỉ phân phối cho máy chưa nhận link trong chu kỳ hiện tại
+    # và hiện đang không có link chờ mở
+    candidates = [
+        ip
+        for ip in sorted(active_ips)
+        if ip not in cycle_served_ips and machines[ip].get("last_cycle", -1) != current_cycle_id and not machines[ip]["queue"]
+    ]
+
+    for ip in candidates:
         if not pending_urls:
             break
         machines[ip]["queue"].append(pending_urls.popleft())
+        machines[ip]["last_cycle"] = current_cycle_id
+        cycle_served_ips.add(ip)
 
 
 ALLOWED_COMMANDS = (
@@ -363,6 +378,7 @@ async def status():
         "allowed_commands": list(ALLOWED_COMMANDS),
         "machine_count": machine_count,
         "pending_count": pending_count,
+        "cycle_id": current_cycle_id,
     })
 
 
@@ -403,8 +419,10 @@ async def clear_links():
         links.clear()
         known_urls.clear()
         pending_urls.clear()
+        cycle_served_ips.clear()
         for machine in machines.values():
             machine["queue"].clear()
+            machine["last_cycle"] = -1
     return JSONResponse({"ok": True})
 
 
@@ -429,9 +447,6 @@ async def machine_next(request: Request):
         q: Deque[str] = machines[ip]["queue"]
         url = q.popleft() if q else None
 
-        # sau khi máy vừa lấy xong, tiếp tục phân phối phần pending cho các máy khác nếu có
-        distribute_links_locked()
-
     return JSONResponse({"ok": True, "url": url, "ip": ip})
 
 
@@ -455,6 +470,7 @@ async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(
 
     accepted = 0
     async with link_lock:
+        prev_pending = len(pending_urls)
         for raw in arr:
             if not isinstance(raw, str):
                 continue
@@ -474,10 +490,18 @@ async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(
             for item in removed:
                 known_urls.discard(item.get("url"))
 
+        # Nếu có link mới đi vào pending thì mở chu kỳ phân phối mới
+        if len(pending_urls) > prev_pending:
+            global current_cycle_id
+            current_cycle_id += 1
+            cycle_served_ips.clear()
+            for machine in machines.values():
+                machine["last_cycle"] = -1
+
         prune_inactive_machines_locked()
         distribute_links_locked()
 
-    return JSONResponse({"ok": True, "accepted": accepted})
+    return JSONResponse({"ok": True, "accepted": accepted, "cycle_id": current_cycle_id})
 
 
 # ===================== MAIN =====================
