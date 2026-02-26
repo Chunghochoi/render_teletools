@@ -25,6 +25,7 @@ pending_urls: Deque[str] = deque()  # chờ phân phối cho máy
 
 # phân phối theo chu kỳ: mỗi máy tối đa 1 link / 1 chu kỳ nhận link từ bot
 current_cycle_id = 0
+current_cycle_started_at = 0.0
 cycle_served_ips = set()
 
 # machine theo IP
@@ -96,6 +97,14 @@ def distribute_links_locked():
         machines[ip]["queue"].append(pending_urls.popleft())
         machines[ip]["last_cycle"] = current_cycle_id
         cycle_served_ips.add(ip)
+
+
+def has_any_assigned_queue_locked() -> bool:
+    for info in machines.values():
+        q = info.get("queue")
+        if q and len(q) > 0:
+            return True
+    return False
 
 
 ALLOWED_COMMANDS = (
@@ -379,6 +388,7 @@ async def status():
         "machine_count": machine_count,
         "pending_count": pending_count,
         "cycle_id": current_cycle_id,
+        "cycle_started_at": current_cycle_started_at,
     })
 
 
@@ -420,6 +430,8 @@ async def clear_links():
         known_urls.clear()
         pending_urls.clear()
         cycle_served_ips.clear()
+        global current_cycle_started_at
+        current_cycle_started_at = 0.0
         for machine in machines.values():
             machine["queue"].clear()
             machine["last_cycle"] = -1
@@ -446,6 +458,17 @@ async def machine_next(request: Request):
 
         q: Deque[str] = machines[ip]["queue"]
         url = q.popleft() if q else None
+
+        # Nếu cycle hiện tại đã được tiêu thụ hết lượt đầu và vẫn còn pending,
+        # mở cycle mới để phân phối lượt tiếp theo (mỗi máy lại tối đa 1 link).
+        if pending_urls and not has_any_assigned_queue_locked():
+            global current_cycle_id, current_cycle_started_at
+            current_cycle_id += 1
+            current_cycle_started_at = now_ts()
+            cycle_served_ips.clear()
+            for machine in machines.values():
+                machine["last_cycle"] = -1
+            distribute_links_locked()
 
     return JSONResponse({"ok": True, "url": url, "ip": ip})
 
@@ -490,13 +513,18 @@ async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(
             for item in removed:
                 known_urls.discard(item.get("url"))
 
-        # Nếu có link mới đi vào pending thì mở chu kỳ phân phối mới
+        # Nếu hệ thống đang rảnh mà nhận link mới thì mở cycle mới.
+        # Nếu đang có cycle chạy dở, giữ nguyên cycle để tránh 1 máy ăn nhiều link khi links đến sát nhau.
         if len(pending_urls) > prev_pending:
-            global current_cycle_id
-            current_cycle_id += 1
-            cycle_served_ips.clear()
-            for machine in machines.values():
-                machine["last_cycle"] = -1
+            global current_cycle_id, current_cycle_started_at
+            prune_inactive_machines_locked()
+            had_work_before = prev_pending > 0 or has_any_assigned_queue_locked()
+            if (not had_work_before) or current_cycle_id == 0:
+                current_cycle_id += 1
+                current_cycle_started_at = now_ts()
+                cycle_served_ips.clear()
+                for machine in machines.values():
+                    machine["last_cycle"] = -1
 
         prune_inactive_machines_locked()
         distribute_links_locked()
