@@ -14,24 +14,19 @@ if not API_KEY:
     print("[WARN] API_KEY env is empty. Agent endpoints will be unprotected!")
 
 MACHINE_TTL_SECONDS = 60
-CYCLE_RELEASE_DELAY_SECONDS = 1.0
 CMD_MAX = 300
 LINK_MAX = 3000
 
 # ===================== IN-MEMORY STORE =====================
 commands: List[Dict[str, Any]] = []  # queue: {id, ts, cmd, count, delay}
-links: List[Dict[str, Any]] = []  # history {ts, url}
-known_urls = set()  # chống push trùng cùng URL
-pending_urls: Deque[str] = deque()  # chờ phân phối cho máy
+links: List[Dict[str, Any]] = []  # history links đã nhận
+known_urls = set()  # chống trùng URL toàn cục
 
-# phân phối theo chu kỳ: mỗi máy tối đa 1 link / 1 chu kỳ nhận link từ bot
-current_cycle_id = 0
-current_cycle_started_at = 0.0
-current_cycle_released = False  # chỉ cho máy mở link khi đã gán ẩn xong trong cycle
-cycle_served_ips = set()
+# Links chờ gán (ẩn) cho máy
+pending_unassigned: Deque[str] = deque()
 
 # machine theo IP
-# machines[ip] = {"last_seen": float, "queue": deque[str], "last_cycle": int}
+# machines[ip] = {"last_seen": float, "queue": deque[str]}
 machines: Dict[str, Dict[str, Any]] = {}
 
 cmd_lock = asyncio.Lock()
@@ -60,95 +55,43 @@ def get_client_ip(request: Request) -> str:
 
 def ensure_machine(ip: str):
     if ip not in machines:
-        machines[ip] = {"last_seen": now_ts(), "queue": deque(), "last_cycle": -1}
+        machines[ip] = {"last_seen": now_ts(), "queue": deque()}
     else:
         machines[ip]["last_seen"] = now_ts()
+
+
+def active_ips_locked() -> List[str]:
+    ts = now_ts()
+    return [ip for ip, info in machines.items() if (ts - float(info.get("last_seen", 0))) <= MACHINE_TTL_SECONDS]
 
 
 def prune_inactive_machines_locked():
     ts = now_ts()
     stale = [ip for ip, info in machines.items() if (ts - float(info.get("last_seen", 0))) > MACHINE_TTL_SECONDS]
     for ip in stale:
-        # trả link đang giữ (nếu có) về pending để không mất link
+        # trả link chưa mở về chờ gán để không mất
         q = machines[ip].get("queue") or deque()
         while q:
-            pending_urls.appendleft(q.pop())
-        cycle_served_ips.discard(ip)
+            pending_unassigned.appendleft(q.pop())
         del machines[ip]
 
 
-def distribute_links_locked():
-    # Mỗi chu kỳ: mỗi máy chỉ được nhận tối đa 1 link
-    active_ips = active_ips_locked()
-    if not active_ips or not pending_urls:
-        return
-
-    # chỉ phân phối cho máy chưa nhận link trong chu kỳ hiện tại
-    # và hiện đang không có link chờ mở
-    candidates = [
-        ip
-        for ip in sorted(active_ips)
-        if ip not in cycle_served_ips and machines[ip].get("last_cycle", -1) != current_cycle_id and not machines[ip]["queue"]
-    ]
-
-    for ip in candidates:
-        if not pending_urls:
-            break
-        machines[ip]["queue"].append(pending_urls.popleft())
-        machines[ip]["last_cycle"] = current_cycle_id
-        cycle_served_ips.add(ip)
-
-    maybe_release_cycle_locked()
-
-
-def has_any_assigned_queue_locked() -> bool:
-    for info in machines.values():
-        q = info.get("queue")
-        if q and len(q) > 0:
-            return True
-    return False
-
-
-def active_ips_locked() -> List[str]:
-    return [
-        ip for ip, info in machines.items() if now_ts() - float(info.get("last_seen", 0)) <= MACHINE_TTL_SECONDS
-    ]
-
-
-def maybe_release_cycle_locked():
+def assign_all_pending_locked():
     """
-    Release cycle khi đã gán ẩn xong lượt hiện tại:
-    - chờ một khoảng ngắn để gom các link đến gần nhau,
-    - sau đó release khi pending hết hoặc không còn máy nào có thể gán thêm trong cycle.
+    Logic đúng yêu cầu:
+    - Sau khi bot trả links (đã push lên server), server gán ẨN toàn bộ links cho từng máy.
+    - Gán xong mới để từng máy lấy link mở tab.
+    - Gán kiểu vòng tròn: link1->máy1, link2->máy2, ...
     """
-    global current_cycle_released
-
-    if current_cycle_released:
+    active_ips = sorted(active_ips_locked())
+    if not active_ips or not pending_unassigned:
         return
 
-    if current_cycle_started_at <= 0:
-        return
-
-    if (now_ts() - current_cycle_started_at) < CYCLE_RELEASE_DELAY_SECONDS:
-        return
-
-    if not pending_urls:
-        current_cycle_released = True
-        return
-
-    for ip in active_ips_locked():
-        machine = machines[ip]
-        if ip in cycle_served_ips:
-            continue
-        if machine.get("last_cycle", -1) == current_cycle_id:
-            continue
-        if machine["queue"]:
-            continue
-        # vẫn còn máy để gán trong cycle hiện tại => chưa release
-        return
-
-    # không còn máy nào để gán thêm trong cycle hiện tại
-    current_cycle_released = True
+    idx = 0
+    while pending_unassigned:
+        ip = active_ips[idx % len(active_ips)]
+        machines[ip]["queue"].append(pending_unassigned.popleft())
+        idx += 1
 
 
 ALLOWED_COMMANDS = (
@@ -205,7 +148,7 @@ def page() -> str:
         <span class="pill" id="status">loading...</span>
         <span class="pill" id="machines">0 machines</span>
       </h1>
-      <span class="pill">Auto phân phối theo IP máy đang online</span>
+      <span class="pill">Gán link ẩn xong mới mở trên từng máy</span>
     </div>
 
     <div class="row">
@@ -232,7 +175,7 @@ def page() -> str:
     </div>
 
     <div class="hint">
-      Mỗi IP mở trang này được xem là 1 máy. Khi có links mới, server phân phối mỗi máy tối đa 1 link/đợt, không trùng.
+      Khi links lên server, hệ thống gán ẩn toàn bộ links cho máy theo IP trước, sau đó máy mới lấy link để mở tab.
     </div>
   </div>
 
@@ -368,14 +311,12 @@ async function openAll() {
 }
 
 async function machinePing() {
-  try {
-    await fetch('/api/machine/ping', { method: 'POST' });
-  } catch (e) {}
+  try { await fetch('/api/machine/ping', { method: 'POST' }); }
+  catch (e) {}
 }
 
 async function machineFetchAndOpen() {
   if (!autoOpenEnabled) return;
-
   try {
     const r = await fetch('/api/machine/next', { method: 'POST' });
     const j = await r.json();
@@ -416,7 +357,7 @@ async def home(request: Request):
     async with link_lock:
         ensure_machine(ip)
         prune_inactive_machines_locked()
-        distribute_links_locked()
+        assign_all_pending_locked()
     return HTMLResponse(page())
 
 
@@ -425,16 +366,15 @@ async def status():
     async with link_lock:
         prune_inactive_machines_locked()
         machine_count = len(machines)
-        pending_count = len(pending_urls)
-    return JSONResponse({
-        "ok": True,
-        "allowed_commands": list(ALLOWED_COMMANDS),
-        "machine_count": machine_count,
-        "pending_count": pending_count,
-        "cycle_id": current_cycle_id,
-        "cycle_started_at": current_cycle_started_at,
-        "cycle_released": current_cycle_released,
-    })
+        pending_count = len(pending_unassigned)
+    return JSONResponse(
+        {
+            "ok": True,
+            "allowed_commands": list(ALLOWED_COMMANDS),
+            "machine_count": machine_count,
+            "pending_count": pending_count,
+        }
+    )
 
 
 @app.post("/api/command")
@@ -470,17 +410,12 @@ async def get_links():
 
 @app.post("/api/links/clear")
 async def clear_links():
-    global current_cycle_started_at, current_cycle_released
     async with link_lock:
         links.clear()
         known_urls.clear()
-        pending_urls.clear()
-        cycle_served_ips.clear()
-        current_cycle_started_at = 0.0
-        current_cycle_released = False
+        pending_unassigned.clear()
         for machine in machines.values():
             machine["queue"].clear()
-            machine["last_cycle"] = -1
     return JSONResponse({"ok": True})
 
 
@@ -490,33 +425,20 @@ async def machine_ping(request: Request):
     async with link_lock:
         ensure_machine(ip)
         prune_inactive_machines_locked()
-        distribute_links_locked()
+        assign_all_pending_locked()
         return JSONResponse({"ok": True, "ip": ip, "machine_count": len(machines)})
 
 
 @app.post("/api/machine/next")
 async def machine_next(request: Request):
-    global current_cycle_id, current_cycle_started_at, current_cycle_released
     ip = get_client_ip(request)
     async with link_lock:
         ensure_machine(ip)
         prune_inactive_machines_locked()
-        distribute_links_locked()
+        assign_all_pending_locked()
 
-        maybe_release_cycle_locked()
         q: Deque[str] = machines[ip]["queue"]
-        url = q.popleft() if (current_cycle_released and q) else None
-
-        # Khi tất cả máy đã lấy xong link đã gán của cycle hiện tại,
-        # nếu vẫn còn pending thì mở cycle mới (2 pha: gán ẩn rồi mới release mở link).
-        if not has_any_assigned_queue_locked() and pending_urls:
-            current_cycle_id += 1
-            current_cycle_started_at = now_ts()
-            current_cycle_released = False
-            cycle_served_ips.clear()
-            for machine in machines.values():
-                machine["last_cycle"] = -1
-            distribute_links_locked()
+        url = q.popleft() if q else None
 
     return JSONResponse({"ok": True, "url": url, "ip": ip})
 
@@ -534,7 +456,6 @@ async def pull_command(x_api_key: Optional[str] = Header(default=None, alias="X-
 
 @app.post("/api/push_links")
 async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")):
-    global current_cycle_id, current_cycle_started_at, current_cycle_released
     require_agent(x_api_key)
     arr = payload.get("links", [])
     if not isinstance(arr, list):
@@ -542,7 +463,6 @@ async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(
 
     accepted = 0
     async with link_lock:
-        prev_pending = len(pending_urls)
         for raw in arr:
             if not isinstance(raw, str):
                 continue
@@ -552,7 +472,7 @@ async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(
 
             known_urls.add(url)
             links.append({"ts": now_ts(), "url": url})
-            pending_urls.append(url)
+            pending_unassigned.append(url)
             accepted += 1
 
         if len(links) > LINK_MAX:
@@ -562,23 +482,11 @@ async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(
             for item in removed:
                 known_urls.discard(item.get("url"))
 
-        # Nếu hệ thống đang rảnh mà nhận link mới thì mở cycle mới.
-        # Nếu đang có cycle chạy dở, giữ nguyên cycle để tránh 1 máy ăn nhiều link khi links đến sát nhau.
-        if len(pending_urls) > prev_pending:
-            prune_inactive_machines_locked()
-            had_work_before = prev_pending > 0 or has_any_assigned_queue_locked()
-            if (not had_work_before) or current_cycle_id == 0:
-                current_cycle_id += 1
-                current_cycle_started_at = now_ts()
-                current_cycle_released = False
-                cycle_served_ips.clear()
-                for machine in machines.values():
-                    machine["last_cycle"] = -1
-
         prune_inactive_machines_locked()
-        distribute_links_locked()
+        # Gán ẩn toàn bộ links vừa nhận cho máy ngay trên server
+        assign_all_pending_locked()
 
-    return JSONResponse({"ok": True, "accepted": accepted, "cycle_id": current_cycle_id})
+    return JSONResponse({"ok": True, "accepted": accepted})
 
 
 # ===================== MAIN =====================
