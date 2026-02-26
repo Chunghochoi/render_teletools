@@ -1,28 +1,34 @@
+import asyncio
 import os
 import time
-import asyncio
-from typing import List, Dict, Any, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 # ===================== CONFIG =====================
-# Chỉ AGENT cần API_KEY (để pull/push). WEB KHÔNG CẦN.
-API_KEY = os.environ.get("API_KEY", "")  # set trên Render
+API_KEY = os.environ.get("API_KEY", "")
 if not API_KEY:
     print("[WARN] API_KEY env is empty. Agent endpoints will be unprotected!")
 
-# In-memory storage (Render free sleep/restart => mất dữ liệu)
+MACHINE_TTL_SECONDS = 60
+CMD_MAX = 300
+LINK_MAX = 3000
+
+# ===================== IN-MEMORY STORE =====================
 commands: List[Dict[str, Any]] = []  # queue: {id, ts, cmd, count, delay}
-links: List[Dict[str, Any]] = []     # {ts, url}
-claimed_urls = set()  # URL đã được phân phối cho profile nào đó
+links: List[Dict[str, Any]] = []  # history {ts, url}
+known_urls = set()  # chống push trùng cùng URL
+pending_urls: Deque[str] = deque()  # chờ phân phối cho máy
+
+# machine theo IP
+# machines[ip] = {"last_seen": float, "queue": deque[str]}
+machines: Dict[str, Dict[str, Any]] = {}
 
 cmd_lock = asyncio.Lock()
 link_lock = asyncio.Lock()
-
-CMD_MAX = 300
-LINK_MAX = 3000
 
 
 def now_ts() -> float:
@@ -34,13 +40,49 @@ def fmt_time(ts: float) -> str:
 
 
 def require_agent(x_api_key: Optional[str]):
-    # Nếu bạn set API_KEY => bắt buộc đúng key
-    # Nếu bạn không set API_KEY => ai cũng gọi được (không khuyến nghị)
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized (agent)")
 
 
-# ✅ Danh sách lệnh hợp lệ (đã sửa /uptolinksocical + thêm /view /checkin)
+def get_client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return (request.client.host if request.client else "unknown").strip() or "unknown"
+
+
+def ensure_machine(ip: str):
+    if ip not in machines:
+        machines[ip] = {"last_seen": now_ts(), "queue": deque()}
+    else:
+        machines[ip]["last_seen"] = now_ts()
+
+
+def prune_inactive_machines_locked():
+    ts = now_ts()
+    stale = [ip for ip, info in machines.items() if (ts - float(info.get("last_seen", 0))) > MACHINE_TTL_SECONDS]
+    for ip in stale:
+        # trả link đang giữ (nếu có) về pending để không mất link
+        q = machines[ip].get("queue") or deque()
+        while q:
+            pending_urls.appendleft(q.pop())
+        del machines[ip]
+
+
+def distribute_links_locked():
+    # Mỗi máy nhận tối đa 1 link tại một thời điểm
+    active_ips = [ip for ip, info in machines.items() if now_ts() - float(info.get("last_seen", 0)) <= MACHINE_TTL_SECONDS]
+    if not active_ips:
+        return
+
+    # Ưu tiên máy nào chưa có task
+    idle_ips = [ip for ip in active_ips if not machines[ip]["queue"]]
+    for ip in idle_ips:
+        if not pending_urls:
+            break
+        machines[ip]["queue"].append(pending_urls.popleft())
+
+
 ALLOWED_COMMANDS = (
     "/start",
     "/uptolinkstep2",
@@ -93,9 +135,9 @@ def page() -> str:
       <h1>
         Uptolink Dashboard (Relay)
         <span class="pill" id="status">loading...</span>
-        <span class="pill">Public UI (no API key)</span>
+        <span class="pill" id="machines">0 machines</span>
       </h1>
-      <span class="pill">Render free: RAM only (restart/sleep = mất links)</span>
+      <span class="pill">Auto phân phối theo IP máy đang online</span>
     </div>
 
     <div class="row">
@@ -117,11 +159,12 @@ def page() -> str:
 
         <button class="secondary" onclick="refreshAll()">Refresh</button>
         <button class="danger" onclick="clearLinks()">Clear links</button>
+        <button id="autoBtn" class="secondary" onclick="toggleAutoOpen()">Auto-open: OFF</button>
       </div>
     </div>
 
     <div class="hint">
-      Bấm nút → agent trên máy bạn poll lệnh → gửi bot → lọc link uptolink → đẩy link lên đây.
+      Mỗi IP mở trang này được xem là 1 máy. Khi có links mới, server phân phối mỗi máy tối đa 1 link/đợt, không trùng.
     </div>
   </div>
 
@@ -135,7 +178,6 @@ def page() -> str:
       <input class="search" id="q" placeholder="Search in links..." oninput="renderLinks()" />
       <button class="secondary" onclick="copyAll()">Copy all</button>
       <button class="secondary" onclick="openAll()">Open all</button>
-      <button id="autoBtn" class="secondary" onclick="toggleAutoOpen()">Auto-open: OFF</button>
     </div>
 
     <div class="linksBox" id="links">(loading...)</div>
@@ -145,24 +187,29 @@ def page() -> str:
 <script>
 let cachedLinks = [];
 let autoOpenEnabled = localStorage.getItem('autoOpenEnabled') === '1';
-const profileClientId = (() => {
-  const k = 'profileClientId';
-  let v = localStorage.getItem(k);
-  if (!v) {
-    v = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(16).slice(2));
-    localStorage.setItem(k, v);
-  }
-  return v;
-})();
 
 async function getStatus() {
   try {
     const r = await fetch('/api/status');
     const j = await r.json();
     document.getElementById('status').textContent = j.ok ? 'ok' : 'not ready';
+    document.getElementById('machines').textContent = `${j.machine_count || 0} machines`;
   } catch (e) {
     document.getElementById('status').textContent = 'offline';
   }
+}
+
+function updateAutoButton() {
+  const b = document.getElementById('autoBtn');
+  if (!b) return;
+  b.textContent = 'Auto-open: ' + (autoOpenEnabled ? 'ON' : 'OFF');
+  b.style.background = autoOpenEnabled ? '#0f9d58' : '#243055';
+}
+
+function toggleAutoOpen() {
+  autoOpenEnabled = !autoOpenEnabled;
+  localStorage.setItem('autoOpenEnabled', autoOpenEnabled ? '1' : '0');
+  updateAutoButton();
 }
 
 function readParams() {
@@ -196,7 +243,7 @@ function escapeHtml(s) {
     .replaceAll('<','&lt;')
     .replaceAll('>','&gt;')
     .replaceAll('"','&quot;')
-    .replaceAll("'","&#39;");
+    .replaceAll("'",'&#39;');
 }
 
 function renderLinks() {
@@ -252,33 +299,23 @@ async function openAll() {
   }
 }
 
-
-function updateAutoButton() {
-  const b = document.getElementById('autoBtn');
-  if (!b) return;
-  b.textContent = 'Auto-open: ' + (autoOpenEnabled ? 'ON' : 'OFF');
-  b.style.background = autoOpenEnabled ? '#0f9d58' : '#243055';
-}
-
-function toggleAutoOpen() {
-  autoOpenEnabled = !autoOpenEnabled;
-  localStorage.setItem('autoOpenEnabled', autoOpenEnabled ? '1' : '0');
-  updateAutoButton();
-}
-
-async function claimAndOpenOne() {
-  if (!autoOpenEnabled) return;
+async function machinePing() {
   try {
-    const r = await fetch('/api/links/claim', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ client_id: profileClientId })
-    });
+    await fetch('/api/machine/ping', { method: 'POST' });
+  } catch (e) {}
+}
+
+async function machineFetchAndOpen() {
+  if (!autoOpenEnabled) return;
+
+  try {
+    const r = await fetch('/api/machine/next', { method: 'POST' });
     const j = await r.json();
     if (!r.ok || !j.ok || !j.url) return;
-    const win = window.open(j.url, '_blank', 'noopener');
-    if (!win) {
-      console.warn('Popup blocked: browser chặn mở tab tự động. Hãy cho phép popups cho site này.');
+
+    const w = window.open(j.url, '_blank', 'noopener');
+    if (!w) {
+      console.warn('Popup blocked. Hãy cho phép popups cho site này để tự động mở tab.');
     }
   } catch (e) {}
 }
@@ -291,9 +328,11 @@ async function refreshAll() {
 async function boot() {
   updateAutoButton();
   await refreshAll();
+
   setInterval(refreshLinks, 1500);
-  setInterval(getStatus, 5000);
-  setInterval(claimAndOpenOne, 1200);
+  setInterval(getStatus, 3000);
+  setInterval(machinePing, 2000);
+  setInterval(machineFetchAndOpen, 1500);
 }
 boot();
 </script>
@@ -304,13 +343,27 @@ boot();
 
 # ===================== ROUTES (PUBLIC WEB) =====================
 @app.get("/", response_class=HTMLResponse)
-async def home():
+async def home(request: Request):
+    ip = get_client_ip(request)
+    async with link_lock:
+        ensure_machine(ip)
+        prune_inactive_machines_locked()
+        distribute_links_locked()
     return HTMLResponse(page())
 
 
 @app.get("/api/status")
 async def status():
-    return JSONResponse({"ok": True, "allowed_commands": list(ALLOWED_COMMANDS)})
+    async with link_lock:
+        prune_inactive_machines_locked()
+        machine_count = len(machines)
+        pending_count = len(pending_urls)
+    return JSONResponse({
+        "ok": True,
+        "allowed_commands": list(ALLOWED_COMMANDS),
+        "machine_count": machine_count,
+        "pending_count": pending_count,
+    })
 
 
 @app.post("/api/command")
@@ -348,8 +401,38 @@ async def get_links():
 async def clear_links():
     async with link_lock:
         links.clear()
-        claimed_urls.clear()
+        known_urls.clear()
+        pending_urls.clear()
+        for machine in machines.values():
+            machine["queue"].clear()
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/machine/ping")
+async def machine_ping(request: Request):
+    ip = get_client_ip(request)
+    async with link_lock:
+        ensure_machine(ip)
+        prune_inactive_machines_locked()
+        distribute_links_locked()
+        return JSONResponse({"ok": True, "ip": ip, "machine_count": len(machines)})
+
+
+@app.post("/api/machine/next")
+async def machine_next(request: Request):
+    ip = get_client_ip(request)
+    async with link_lock:
+        ensure_machine(ip)
+        prune_inactive_machines_locked()
+        distribute_links_locked()
+
+        q: Deque[str] = machines[ip]["queue"]
+        url = q.popleft() if q else None
+
+        # sau khi máy vừa lấy xong, tiếp tục phân phối phần pending cho các máy khác nếu có
+        distribute_links_locked()
+
+    return JSONResponse({"ok": True, "url": url, "ip": ip})
 
 
 # ===================== ROUTES (AGENT ONLY) =====================
@@ -370,33 +453,31 @@ async def push_links(payload: Dict[str, Any], x_api_key: Optional[str] = Header(
     if not isinstance(arr, list):
         return JSONResponse({"ok": False, "error": "links must be a list"}, status_code=400)
 
+    accepted = 0
     async with link_lock:
-        for url in arr:
-            if isinstance(url, str) and url:
-                links.append({"ts": now_ts(), "url": url})
+        for raw in arr:
+            if not isinstance(raw, str):
+                continue
+            url = raw.strip()
+            if not url or url in known_urls:
+                continue
+
+            known_urls.add(url)
+            links.append({"ts": now_ts(), "url": url})
+            pending_urls.append(url)
+            accepted += 1
+
         if len(links) > LINK_MAX:
-            del links[: len(links) - LINK_MAX]
+            extra = len(links) - LINK_MAX
+            removed = links[:extra]
+            del links[:extra]
+            for item in removed:
+                known_urls.discard(item.get("url"))
 
-    return JSONResponse({"ok": True})
+        prune_inactive_machines_locked()
+        distribute_links_locked()
 
-
-@app.post("/api/links/claim")
-async def claim_link(payload: Dict[str, Any]):
-    client_id = str(payload.get("client_id", "")).strip()
-    if not client_id:
-        return JSONResponse({"ok": False, "error": "client_id is required"}, status_code=400)
-
-    async with link_lock:
-        for item in links:
-            url = item.get("url")
-            if not isinstance(url, str) or not url:
-                continue
-            if url in claimed_urls:
-                continue
-            claimed_urls.add(url)
-            return JSONResponse({"ok": True, "url": url})
-
-    return JSONResponse({"ok": True, "url": None})
+    return JSONResponse({"ok": True, "accepted": accepted})
 
 
 # ===================== MAIN =====================
