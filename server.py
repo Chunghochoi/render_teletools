@@ -352,7 +352,7 @@ async function copyText(encoded) {{
 
 async function copyAll() {{
   if (!cachedLinks.length) return;
-  await navigator.clipboard.writeText(cachedLinks.map(x => x.url).join('\n'));
+  await navigator.clipboard.writeText(cachedLinks.map(x => x.url).join('\\n'));
 }}
 
 async function openAll() {{
